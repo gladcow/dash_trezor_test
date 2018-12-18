@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+from trezorlib.transport import get_transport
+from trezorlib.tools import normalize_nfc, parse_path
+from trezorlib.client import TrezorClient
+from trezorlib import (btc, messages, ui)
+from decimal import Decimal
+from dash_config import DashConfig
+from dashd_api import DashdApi
+import requests
+import base64
+
+_DASH_COIN = 100000000
+
+
+def _rpc_to_input(vin):
+    i = messages.TxInputType()
+    if "coinbase" in vin:
+        i.prev_hash = b"\0" * 32
+        i.prev_index = 0xFFFFFFFF  # signed int -1
+        i.script_sig = bytes.fromhex(vin["coinbase"])
+        i.sequence = vin["sequence"]
+
+    else:
+        i.prev_hash = bytes.fromhex(vin["txid"])
+        i.prev_index = vin["vout"]
+        i.script_sig = bytes.fromhex(vin["scriptSig"]["hex"])
+        i.sequence = vin["sequence"]
+
+    return i
+
+
+def _rpc_to_bin_output(vout):
+    o = messages.TxOutputBinType()
+    o.amount = int(Decimal(vout["value"]) * 100000000)
+    o.script_pubkey = bytes.fromhex(vout["scriptPubKey"]["hex"])
+
+    return o
+
+
+def rpc_tx_to_msg_tx(data):
+    t = messages.TransactionType()
+    t.version = data["version"]
+    t.lock_time = data.get("locktime")
+
+    t.inputs = [_rpc_to_input(vin) for vin in data["vin"]]
+    t.bin_outputs = [_rpc_to_bin_output(vout) for vout in data["vout"]]
+
+    return t
+
+
+def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_payload = None):
+    # set up a transactions dict
+    txes = {None: messages.TransactionType(inputs=inputs, outputs=outputs, extra_data=extra_payload, extra_data_len=len(extra_payload))}
+    # preload all relevant transactions ahead of time
+    for inp in inputs:
+        try:
+            prev_tx = prev_txes[inp.prev_hash]
+        except Exception as e:
+            raise ValueError("Could not retrieve prev_tx") from e
+        if not isinstance(prev_tx, messages.TransactionType):
+            raise ValueError("Invalid value for prev_tx") from None
+        txes[inp.prev_hash] = prev_tx
+
+    if details is None:
+        signtx = messages.SignTx()
+    else:
+        signtx = details
+
+    signtx.coin_name = 'Dash Testnet'
+    signtx.inputs_count = len(inputs)
+    signtx.outputs_count = len(outputs)
+
+    res = client.call(signtx)
+
+    # Prepare structure for signatures
+    signatures = [None] * len(inputs)
+    serialized_tx = b""
+
+    def copy_tx_meta(tx):
+        tx_copy = messages.TransactionType()
+        tx_copy.CopyFrom(tx)
+        # clear fields
+        tx_copy.inputs_cnt = len(tx.inputs)
+        tx_copy.inputs = []
+        tx_copy.outputs_cnt = len(tx.bin_outputs or tx.outputs)
+        tx_copy.outputs = []
+        tx_copy.bin_outputs = []
+        tx_copy.extra_data_len = len(tx.extra_data or b"")
+        tx_copy.extra_data = None
+        return tx_copy
+
+    R = messages.RequestType
+    while isinstance(res, messages.TxRequest):
+        # If there's some part of signed transaction, let's add it
+        if res.serialized:
+            if res.serialized.serialized_tx:
+                serialized_tx += res.serialized.serialized_tx
+
+            if res.serialized.signature_index is not None:
+                idx = res.serialized.signature_index
+                sig = res.serialized.signature
+                if signatures[idx] is not None:
+                    raise ValueError("Signature for index %d already filled" % idx)
+                signatures[idx] = sig
+
+        if res.request_type == R.TXFINISHED:
+            break
+
+        # Device asked for one more information, let's process it.
+        current_tx = txes[res.details.tx_hash]
+
+        if res.request_type == R.TXMETA:
+            msg = copy_tx_meta(current_tx)
+            res = client.call(messages.TxAck(tx=msg))
+
+        elif res.request_type == R.TXINPUT:
+            msg = messages.TransactionType()
+            msg.inputs = [current_tx.inputs[res.details.request_index]]
+            res = client.call(messages.TxAck(tx=msg))
+
+        elif res.request_type == R.TXOUTPUT:
+            msg = messages.TransactionType()
+            if res.details.tx_hash:
+                msg.bin_outputs = [current_tx.bin_outputs[res.details.request_index]]
+            else:
+                msg.outputs = [current_tx.outputs[res.details.request_index]]
+
+            res = client.call(messages.TxAck(tx=msg))
+
+        elif res.request_type == R.TXEXTRADATA:
+            o, l = res.details.extra_data_offset, res.details.extra_data_len
+            msg = messages.TransactionType()
+            msg.extra_data = current_tx.extra_data[o: o + l]
+            res = client.call(messages.TxAck(tx=msg))
+
+    if isinstance(res, messages.Failure):
+        raise RuntimeError("Signing failed")
+
+    if not isinstance(res, messages.TxRequest):
+        raise RuntimeError("Unexpected message")
+
+    if None in signatures:
+        raise RuntimeError("Some signatures are missing!")
+
+    return signatures, serialized_tx
+
+
+class InsightApi:
+    def __init__(self, url):
+        self.url = url
+
+    def _fetch_json(self, *path, **params):
+        url = self.url + "/".join(map(str, path))
+        return requests.get(url, params=params).json(parse_float=Decimal)
+
+    def get_tx(self, txhash):
+        data = self._fetch_json("tx", txhash)
+        return rpc_tx_to_msg_tx(data)
+
+    def get_addr_data(self, address):
+        return self._fetch_json("addr", address)
+
+    def get_addr_utxo(self, address):
+        return self._fetch_json("addr", address, "utxo")
+
+
+class DashTrezor:
+    def __init__(self, client):
+        self.client = client
+        # Get the first address of first BIP44 account
+        # (should be the same address as shown in wallet.trezor.io)
+        self.bip32_path = parse_path("44'/1'/0'/0/0")
+        self.address = self.client.get_address('Dash Testnet', self.bip32_path)
+        path = parse_path("44'/1'/0'/0/0/0")
+        self.collateral_address = self.client.get_address('Dash Testnet', path)
+        # api to get balance, etc
+        self.api = InsightApi('https://testnet-insight.dashevo.org/insight-api/')
+
+    def trezor_balance(self):
+        data = self.api.get_addr_data(self.address)
+        return data['balance']
+
+    def send_to_address(self, address, amount):
+        # prepare inputs
+        txes = {}
+        inputs = []
+        trezor_address_data = self.api.get_addr_utxo(self.address)
+        in_amount = Decimal(0.0)
+        fee = Decimal(0.0)
+        for utxo in trezor_address_data:
+            if in_amount >= Decimal(amount) + fee:
+                break
+            fee = fee + Decimal(0.00001)
+            new_input = messages.TxInputType(
+                address_n=self.bip32_path,
+                prev_hash=bytes.fromhex(utxo['txid']),
+                prev_index=int(utxo['vout']),
+                amount=int(Decimal(utxo['amount']) * _DASH_COIN),
+                script_type=messages.InputScriptType.SPENDADDRESS,
+                sequence=0xFFFFFFFF,
+            )
+            in_amount += Decimal(utxo['amount'])
+            inputs.append(new_input)
+            txes[bytes.fromhex(utxo['txid'])] = self.api.get_tx(utxo['txid'])
+
+        # prepare outputs
+        outputs = []
+        new_output = messages.TxOutputType(
+            address_n=None,
+            address=address,
+            amount=int(amount * _DASH_COIN),
+            script_type=messages.OutputScriptType.PAYTOADDRESS
+        )
+        outputs.append(new_output)
+        change = int((in_amount - fee) * _DASH_COIN) - int(amount * _DASH_COIN)
+        if change > 1000:
+            change_output = messages.TxOutputType(
+                address_n=None,
+                address=self.address,
+                amount=change,
+                script_type=messages.OutputScriptType.PAYTOADDRESS
+            )
+            outputs.append(change_output)
+
+        # transaction details
+        signtx = messages.SignTx()
+        signtx.version = 2
+        signtx.lock_time = 0
+
+        # sign transaction
+        _, signed_tx = dash_sign_tx(
+            self.client, inputs, outputs, details=signtx, prev_txes=txes
+        )
+
+        return signed_tx
+
+    def get_collateral(self):
+        data = self.api.get_addr_utxo(self.collateral_address)
+        for utxo in data:
+            if Decimal(utxo['amount']) == Decimal(1000.0):
+                return True, utxo['txid'], utxo['vout']
+        return False, None, None
+
+    def register_mn_with_external_collateral(self, dashd):
+        has_collateral, collateral_tx, cout = self.get_collateral()
+        if not has_collateral:
+            collateral_tx = dashd.rpc_command("sendtoaddress",
+                                              self.collateral_address, 1000.0)
+            cout = 0
+        key = dashd.rpc_command("getnewaddress")
+        blsKey = dashd.rpc_command('bls', 'generate')
+        tx = dashd.rpc_command('protx', 'register_prepare', collateral_tx,
+                                 cout, '0.0.0.0:0', key, blsKey['public'],
+                                 key, 0, self.collateral_address)
+        print(tx)
+        signed = self.client.call(
+            messages.SignMessage(
+                coin_name='Dash Testnet',
+                address_n=parse_path("44'/1'/0'/0/0/0"),
+                message=normalize_nfc(tx['signMessage']),
+                script_type=messages.InputScriptType.SPENDADDRESS
+            )
+        )
+        print(signed)
+        signature = base64.b64encode(signed.signature).decode("utf-8")
+        print(signature)
+        res = dashd.rpc_command('protx', 'register_submit', tx['tx'], signature)
+        print(res)
+
+    def get_register_mn_protx(self):
+        # prepare inputs
+        txes = {}
+        inputs = []
+        trezor_address_data = self.api.get_addr_utxo(self.collateral_address)
+        in_amount = Decimal(0.0)
+        fee = Decimal(0.0)
+        for utxo in trezor_address_data:
+            if in_amount >= Decimal(1000.0) + fee:
+                break
+            fee = fee + Decimal(0.00001)
+            new_input = messages.TxInputType(
+                address_n=self.bip32_path,
+                prev_hash=bytes.fromhex(utxo['txid']),
+                prev_index=int(utxo['vout']),
+                amount=int(Decimal(utxo['amount']) * _DASH_COIN),
+                script_type=messages.InputScriptType.SPENDADDRESS,
+                sequence=0xFFFFFFFF,
+            )
+            in_amount += Decimal(utxo['amount'])
+            inputs.append(new_input)
+            txes[bytes.fromhex(utxo['txid'])] = self.api.get_tx(utxo['txid'])
+
+        # prepare outputs
+        outputs = []
+        new_output = messages.TxOutputType(
+            address_n=None,
+            address=self.address,
+            amount=int(1000 * _DASH_COIN),
+            script_type=messages.OutputScriptType.PAYTOADDRESS
+        )
+        outputs.append(new_output)
+        change = int((in_amount - fee) * _DASH_COIN) - int(1000 * _DASH_COIN)
+        if change > 1000:
+            change_output = messages.TxOutputType(
+                address_n=None,
+                address=self.collateral_address,
+                amount=change,
+                script_type=messages.OutputScriptType.PAYTOADDRESS
+            )
+            outputs.append(change_output)
+
+        # transaction details
+        signtx = messages.SignTx()
+        signtx.version = 2
+        signtx.lock_time = 0
+
+        # sign transaction
+        _, signed_tx = dash_sign_tx(
+            self.client, inputs, outputs, details=signtx, prev_txes=txes
+        )
+
+        return signed_tx
+
+
+def main():
+    # Use first connected device
+    transport = get_transport()
+
+    # Creates object for manipulating TREZOR
+    client = TrezorClient(transport=transport, ui=ui.ClickUI)
+
+    dash_trezor = DashTrezor(client)
+    print('Trezor address:', dash_trezor.address)
+    print('Trezor balance:', dash_trezor.trezor_balance())
+
+    dashd = DashdApi.from_dash_conf(DashConfig.get_default_dash_conf())
+    dashd_address = dashd.rpc_command("getnewaddress")
+
+    dash_trezor.register_mn_with_external_collateral(dashd)
+
+#    if dash_trezor.trezor_balance() < 50.0:
+        # send 1 dash from dashd to trezor
+        #dashd.rpc_command("sendtoaddress", dash_trezor.address, 1.0)
+
+    # create raw trx to send funds from trezor back to dashd
+    # signed_tx = dash_trezor.send_to_address(dashd_address, 1.0)
+
+    #print(dashd.rpc_command("sendrawtransaction", signed_tx.hex()))
+
+    client.close()
+
+
+if __name__ == '__main__':
+    main()
