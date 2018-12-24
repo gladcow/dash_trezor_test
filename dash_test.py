@@ -8,6 +8,8 @@ from dash_config import DashConfig
 from dashd_api import DashdApi
 import requests
 import base64
+import struct
+import socket
 
 _DASH_COIN = 100000000
 
@@ -50,7 +52,8 @@ def rpc_tx_to_msg_tx(data):
 
 def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_payload = None):
     # set up a transactions dict
-    txes = {None: messages.TransactionType(inputs=inputs, outputs=outputs, extra_data=extra_payload, extra_data_len=len(extra_payload))}
+    txes = {None: messages.TransactionType(inputs=inputs, outputs=outputs, extra_data=extra_payload,
+                                           extra_data_len=0 if extra_payload is None else len(extra_payload))}
     # preload all relevant transactions ahead of time
     for inp in inputs:
         try:
@@ -145,6 +148,46 @@ def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_pa
     return signatures, serialized_tx
 
 
+def unpack_hex(hex_data):
+    r = b""
+    data_bytes = bytes.fromhex(hex_data)
+    for b in data_bytes:
+        r += struct.pack('c', b)
+    return r
+
+
+def keyid_from_address(address):
+    return address
+
+
+def dash_proregtx_payload(collateral_out,  address, port, ownerKeyId,
+                          operatorKey, votingKeyId, operatorReward,
+                          inputsHash):
+    r = b""
+    r += struct.pack("<H", 1)  # version
+    r += struct.pack('<H', 0)  # masternode type
+    r += struct.pack('<H', 0)  # masternode mode
+    # collateral txid
+    for i in range(0, 32):
+        r += struct.pack("c", 0)
+    r += struct.pack('<I', collateral_out)  # collateral out
+    # ip address
+    if not address=="0.0.0.0":
+        r += socket.inet_aton(address)
+    else:
+        r += struct.pack('<Q', 0)
+        r += struct.pack('<Q', 0)
+    r += struct.pack(">H", port)  # port
+    r += unpack_hex(ownerKeyId)  # owner keyid
+    r += unpack_hex(operatorKey)  # operator key
+    r += unpack_hex(votingKeyId)  # voting keyid
+    r += struct.pack("<H", operatorReward) # operator reward
+    r += struct.pack("c", 0)  # payout script
+    r += unpack_hex(inputsHash)  # inputs hash
+    r += struct.pack("c", 0)  # payload signature
+    return r
+
+
 class InsightApi:
     def __init__(self, url):
         self.url = url
@@ -176,8 +219,10 @@ class DashTrezor:
         # api to get balance, etc
         self.api = InsightApi('https://testnet-insight.dashevo.org/insight-api/')
 
-    def trezor_balance(self):
-        data = self.api.get_addr_data(self.address)
+    def trezor_balance(self, address=None):
+        if address is None:
+            address = self.address
+        data = self.api.get_addr_data(address)
         return data['balance']
 
     def send_to_address(self, address, amount):
@@ -215,8 +260,8 @@ class DashTrezor:
         change = int((in_amount - fee) * _DASH_COIN) - int(amount * _DASH_COIN)
         if change > 1000:
             change_output = messages.TxOutputType(
-                address_n=None,
-                address=self.address,
+                address_n=self.bip32_path,
+                address=None,
                 amount=change,
                 script_type=messages.OutputScriptType.PAYTOADDRESS
             )
@@ -250,7 +295,7 @@ class DashTrezor:
         key = dashd.rpc_command("getnewaddress")
         blsKey = dashd.rpc_command('bls', 'generate')
         tx = dashd.rpc_command('protx', 'register_prepare', collateral_tx,
-                                 cout, '0.0.0.0:0', key, blsKey['public'],
+                                 cout, '0', key, blsKey['public'],
                                  key, 0, self.collateral_address)
         print(tx)
         signed = self.client.call(
@@ -309,6 +354,53 @@ class DashTrezor:
             )
             outputs.append(change_output)
 
+        payload = dash_proregtx_payload(0, "0.0.0.0", 0, )
+
+        # transaction details
+        signtx = messages.SignTx()
+        signtx.version = 3
+        signtx.lock_time = 0
+
+        # sign transaction
+        _, signed_tx = dash_sign_tx(
+            self.client, inputs, outputs, details=signtx, prev_txes=txes, extra_payload=payload
+        )
+
+        return signed_tx
+
+    def move_collateral_to_base(self):
+        # prepare inputs
+        txes = {}
+        inputs = []
+        trezor_address_data = self.api.get_addr_utxo(self.collateral_address)
+        in_amount = Decimal(0.0)
+        fee = Decimal(0.0)
+        for utxo in trezor_address_data:
+            fee = fee + Decimal(0.00001)
+            new_input = messages.TxInputType(
+                address_n=parse_path("44'/1'/0'/0/0/0"),
+                prev_hash=bytes.fromhex(utxo['txid']),
+                prev_index=int(utxo['vout']),
+                amount=int(Decimal(utxo['amount']) * _DASH_COIN),
+                script_type=messages.InputScriptType.SPENDADDRESS,
+                sequence=0xFFFFFFFF,
+            )
+            in_amount += Decimal(utxo['amount'])
+            inputs.append(new_input)
+            txes[bytes.fromhex(utxo['txid'])] = self.api.get_tx(utxo['txid'])
+
+        in_amount -= fee
+
+        # prepare outputs
+        outputs = []
+        new_output = messages.TxOutputType(
+            address_n=self.bip32_path,
+            address=None,
+            amount=int(in_amount * _DASH_COIN),
+            script_type=messages.OutputScriptType.PAYTOADDRESS
+        )
+        outputs.append(new_output)
+
         # transaction details
         signtx = messages.SignTx()
         signtx.version = 2
@@ -332,20 +424,17 @@ def main():
     dash_trezor = DashTrezor(client)
     print('Trezor address:', dash_trezor.address)
     print('Trezor balance:', dash_trezor.trezor_balance())
+    print('Trezor collateral address:', dash_trezor.collateral_address)
+    print('Trezor collateral balance:', dash_trezor.trezor_balance(dash_trezor.collateral_address))
 
     dashd = DashdApi.from_dash_conf(DashConfig.get_default_dash_conf())
-    dashd_address = dashd.rpc_command("getnewaddress")
 
-    dash_trezor.register_mn_with_external_collateral(dashd)
-
-#    if dash_trezor.trezor_balance() < 50.0:
-        # send 1 dash from dashd to trezor
-        #dashd.rpc_command("sendtoaddress", dash_trezor.address, 1.0)
-
-    # create raw trx to send funds from trezor back to dashd
-    # signed_tx = dash_trezor.send_to_address(dashd_address, 1.0)
-
-    #print(dashd.rpc_command("sendrawtransaction", signed_tx.hex()))
+    #dash_trezor.register_mn_with_external_collateral(dashd)
+    tx = dash_trezor.move_collateral_to_base()
+    txid = dashd.rpc_command("sendrawtransaction", tx.hex())
+    print(txid)
+    txid = dashd.rpc_command("sendtoaddress", dash_trezor.address, 2.0)
+    print(txid)
 
     client.close()
 
