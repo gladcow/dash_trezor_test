@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from trezorlib.transport import get_transport
-from trezorlib.tools import normalize_nfc, parse_path
+from trezorlib.tools import  b58decode, btc_hash, normalize_nfc, parse_path
 from trezorlib.client import TrezorClient
 from trezorlib import (btc, messages, ui)
 from decimal import Decimal
@@ -152,12 +152,13 @@ def unpack_hex(hex_data):
     r = b""
     data_bytes = bytes.fromhex(hex_data)
     for b in data_bytes:
-        r += struct.pack('c', b)
+        r += struct.pack('c', b.to_bytes(1, "big"))
     return r
 
 
 def keyid_from_address(address):
-    return address
+    data = b58decode(address)
+    return data[1:].hex()
 
 
 def dash_proregtx_payload(collateral_out,  address, port, ownerKeyId,
@@ -169,7 +170,7 @@ def dash_proregtx_payload(collateral_out,  address, port, ownerKeyId,
     r += struct.pack('<H', 0)  # masternode mode
     # collateral txid
     for i in range(0, 32):
-        r += struct.pack("c", 0)
+        r += struct.pack("c", b'\x00')
     r += struct.pack('<I', collateral_out)  # collateral out
     # ip address
     if not address=="0.0.0.0":
@@ -182,10 +183,21 @@ def dash_proregtx_payload(collateral_out,  address, port, ownerKeyId,
     r += unpack_hex(operatorKey)  # operator key
     r += unpack_hex(votingKeyId)  # voting keyid
     r += struct.pack("<H", operatorReward) # operator reward
-    r += struct.pack("c", 0)  # payout script
-    r += unpack_hex(inputsHash)  # inputs hash
-    r += struct.pack("c", 0)  # payload signature
+    r += struct.pack("c", b'\x00')  # payout script
+    r += inputsHash  # inputs hash
+    r += struct.pack("c", b'\x00')  # payload signature
     return r
+
+
+class HashWriter:
+    def __init__(self):
+        self.data = b''
+
+    def add_data(self, data):
+        self.data += data
+
+    def get_hash(self):
+        return btc_hash(self.data)
 
 
 class InsightApi:
@@ -312,19 +324,20 @@ class DashTrezor:
         res = dashd.rpc_command('protx', 'register_submit', tx['tx'], signature)
         print(res)
 
-    def get_register_mn_protx(self):
+    def get_register_mn_protx(self, operatorKey, operatorReward):
         # prepare inputs
         txes = {}
         inputs = []
-        trezor_address_data = self.api.get_addr_utxo(self.collateral_address)
+        trezor_address_data = self.api.get_addr_utxo(self.address)
         in_amount = Decimal(0.0)
         fee = Decimal(0.0)
+        hash_writer = HashWriter()
         for utxo in trezor_address_data:
             if in_amount >= Decimal(1000.0) + fee:
                 break
             fee = fee + Decimal(0.00001)
             new_input = messages.TxInputType(
-                address_n=self.bip32_path,
+                address_n=parse_path("44'/1'/0'/0/0/0"),
                 prev_hash=bytes.fromhex(utxo['txid']),
                 prev_index=int(utxo['vout']),
                 amount=int(Decimal(utxo['amount']) * _DASH_COIN),
@@ -334,12 +347,14 @@ class DashTrezor:
             in_amount += Decimal(utxo['amount'])
             inputs.append(new_input)
             txes[bytes.fromhex(utxo['txid'])] = self.api.get_tx(utxo['txid'])
+            hash_writer.add_data(bytes.fromhex(utxo['txid']))
+            hash_writer.add_data(int(utxo['vout']).to_bytes(4, "big"))
 
         # prepare outputs
         outputs = []
         new_output = messages.TxOutputType(
             address_n=None,
-            address=self.address,
+            address=self.collateral_address,
             amount=int(1000 * _DASH_COIN),
             script_type=messages.OutputScriptType.PAYTOADDRESS
         )
@@ -347,14 +362,19 @@ class DashTrezor:
         change = int((in_amount - fee) * _DASH_COIN) - int(1000 * _DASH_COIN)
         if change > 1000:
             change_output = messages.TxOutputType(
-                address_n=None,
-                address=self.collateral_address,
+                address_n=self.bip32_path,
+                address=None,
                 amount=change,
                 script_type=messages.OutputScriptType.PAYTOADDRESS
             )
             outputs.append(change_output)
 
-        payload = dash_proregtx_payload(0, "0.0.0.0", 0, )
+        inputsHash = hash_writer.get_hash()
+        payload = dash_proregtx_payload(0, "0.0.0.0", 0,
+                                        keyid_from_address(self.collateral_address),
+                                        operatorKey,
+                                        keyid_from_address(self.collateral_address),
+                                        operatorReward, inputsHash)
 
         # transaction details
         signtx = messages.SignTx()
@@ -430,10 +450,11 @@ def main():
     dashd = DashdApi.from_dash_conf(DashConfig.get_default_dash_conf())
 
     #dash_trezor.register_mn_with_external_collateral(dashd)
-    tx = dash_trezor.move_collateral_to_base()
+    blsKey = dashd.rpc_command('bls', 'generate')
+    tx = dash_trezor.get_register_mn_protx(blsKey['public'], 0)
+    txstruct = dashd.rpc_command("decoderawtransaction", tx.hex())
+    print(txstruct)
     txid = dashd.rpc_command("sendrawtransaction", tx.hex())
-    print(txid)
-    txid = dashd.rpc_command("sendtoaddress", dash_trezor.address, 2.0)
     print(txid)
 
     client.close()
