@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-from trezorlib.transport import get_transport
+from trezorlib.transport import get_transport, get_debug_transport
 from trezorlib.tools import  b58decode, btc_hash, normalize_nfc, parse_path
 from trezorlib.client import TrezorClient
+from trezorlib.debuglink import TrezorClientDebugLink
 from trezorlib import (btc, messages, ui)
 from decimal import Decimal
 from dash_config import DashConfig
@@ -10,6 +11,7 @@ import requests
 import base64
 import struct
 import socket
+from mnemonic import Mnemonic
 
 _DASH_COIN = 100000000
 
@@ -51,6 +53,7 @@ def rpc_tx_to_msg_tx(data):
 
 
 def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_payload = None):
+    print("dash_sign_tx")
     # set up a transactions dict
     txes = {None: messages.TransactionType(inputs=inputs, outputs=outputs, extra_data=extra_payload,
                                            extra_data_len=0 if extra_payload is None else len(extra_payload))}
@@ -107,21 +110,25 @@ def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_pa
                 signatures[idx] = sig
 
         if res.request_type == R.TXFINISHED:
+            print("R.TXFINISHED")
             break
 
         # Device asked for one more information, let's process it.
         current_tx = txes[res.details.tx_hash]
 
         if res.request_type == R.TXMETA:
+            print("R.TXMETA")
             msg = copy_tx_meta(current_tx)
             res = client.call(messages.TxAck(tx=msg))
 
         elif res.request_type == R.TXINPUT:
+            print("R.TXINPUT")
             msg = messages.TransactionType()
             msg.inputs = [current_tx.inputs[res.details.request_index]]
             res = client.call(messages.TxAck(tx=msg))
 
         elif res.request_type == R.TXOUTPUT:
+            print("R.TXOUTPUT")
             msg = messages.TransactionType()
             if res.details.tx_hash:
                 msg.bin_outputs = [current_tx.bin_outputs[res.details.request_index]]
@@ -131,6 +138,7 @@ def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_pa
             res = client.call(messages.TxAck(tx=msg))
 
         elif res.request_type == R.TXEXTRADATA:
+            print("R.TXEXTRADATA")
             o, l = res.details.extra_data_offset, res.details.extra_data_len
             msg = messages.TransactionType()
             msg.extra_data = current_tx.extra_data[o: o + l]
@@ -230,6 +238,25 @@ class DashTrezor:
         self.collateral_address = self.client.get_address('Dash Testnet', path)
         # api to get balance, etc
         self.api = InsightApi('https://testnet-insight.dashevo.org/insight-api/')
+
+    @classmethod
+    def load_device(cls, client, seed_mnemonic):
+        m = Mnemonic.normalize_string(seed_mnemonic)
+        client.call(
+            messages.LoadDevice(
+                mnemonic=m,
+                pin=None,
+                passphrase_protection=False,
+                language="english",
+                label="test",
+                skip_checksum=True,
+            )
+        )
+        client.init_device()
+
+    @classmethod
+    def wipe_device(cls, client):
+        client.call(messages.WipeDevice())
 
     def trezor_balance(self, address=None):
         if address is None:
@@ -380,6 +407,7 @@ class DashTrezor:
         signtx = messages.SignTx()
         signtx.version = 3
         signtx.lock_time = 0
+        signtx.extra_data_len = len(payload)
 
         # sign transaction
         _, signed_tx = dash_sign_tx(
@@ -436,10 +464,14 @@ class DashTrezor:
 
 def main():
     # Use first connected device
-    transport = get_transport()
+    transport = get_debug_transport()
 
     # Creates object for manipulating TREZOR
-    client = TrezorClient(transport=transport, ui=ui.ClickUI)
+    client = TrezorClientDebugLink(transport=transport)
+
+    # Load custom configuration to use device with the same params
+    DashTrezor.load_device(client,
+                           "material humble noble wrestle hen infant quote world name result cake ankle snack buffalo donor vessel chalk bamboo remove announce valid snack alarm index")
 
     dash_trezor = DashTrezor(client)
     print('Trezor address:', dash_trezor.address)
@@ -449,13 +481,19 @@ def main():
 
     dashd = DashdApi.from_dash_conf(DashConfig.get_default_dash_conf())
 
+    #signed_tx = dash_trezor.send_to_address("yPD5e2HPC1m2bJnnqprrrHbGwk8ujFBHRc", 1)
+    #dashd.rpc_command("sendrawtransaction", signed_tx.hex())
     #dash_trezor.register_mn_with_external_collateral(dashd)
-    blsKey = dashd.rpc_command('bls', 'generate')
-    tx = dash_trezor.get_register_mn_protx(blsKey['public'], 0)
-    txstruct = dashd.rpc_command("decoderawtransaction", tx.hex())
-    print(txstruct)
-    txid = dashd.rpc_command("sendrawtransaction", tx.hex())
-    print(txid)
+    #dashd.rpc_command("sendtoaddress", dash_trezor.address, 1001)
+    #blsKey = dashd.rpc_command('bls', 'generate')
+    #tx = dash_trezor.get_register_mn_protx(blsKey['public'], 0)
+    #txstruct = dashd.rpc_command("decoderawtransaction", tx.hex())
+    #print(txstruct)
+    #txid = dashd.rpc_command("sendrawtransaction", tx.hex())
+    #print(txid)
+
+    # wipe device to have ability to load custom configuration in the next run
+    DashTrezor.wipe_device(client)
 
     client.close()
 
