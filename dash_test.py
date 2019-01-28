@@ -75,6 +75,7 @@ def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_pa
     signtx.coin_name = 'Dash Testnet'
     signtx.inputs_count = len(inputs)
     signtx.outputs_count = len(outputs)
+    signtx.extra_data_len = 0 if extra_payload is None else len(extra_payload)
 
     res = client.call(signtx)
 
@@ -97,6 +98,7 @@ def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_pa
 
     R = messages.RequestType
     while isinstance(res, messages.TxRequest):
+        print(res)
         # If there's some part of signed transaction, let's add it
         if res.serialized:
             if res.serialized.serialized_tx:
@@ -153,6 +155,8 @@ def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_pa
     if None in signatures:
         raise RuntimeError("Some signatures are missing!")
 
+    print("Signatures: ", signatures)
+    print("Serialized tx: ", serialized_tx)
     return signatures, serialized_tx
 
 
@@ -165,7 +169,7 @@ def unpack_hex(hex_data):
 
 
 def keyid_from_address(address):
-    data = b58decode(address)
+    data = b58decode(address, None)
     return data[1:].hex()
 
 
@@ -405,9 +409,8 @@ class DashTrezor:
 
         # transaction details
         signtx = messages.SignTx()
-        signtx.version = 3
+        signtx.version = 65539 # (1 << 16) & 3
         signtx.lock_time = 0
-        signtx.extra_data_len = len(payload)
 
         # sign transaction
         _, signed_tx = dash_sign_tx(
@@ -485,12 +488,12 @@ def main():
     #dashd.rpc_command("sendrawtransaction", signed_tx.hex())
     #dash_trezor.register_mn_with_external_collateral(dashd)
     #dashd.rpc_command("sendtoaddress", dash_trezor.address, 1001)
-    #blsKey = dashd.rpc_command('bls', 'generate')
-    #tx = dash_trezor.get_register_mn_protx(blsKey['public'], 0)
-    #txstruct = dashd.rpc_command("decoderawtransaction", tx.hex())
-    #print(txstruct)
-    #txid = dashd.rpc_command("sendrawtransaction", tx.hex())
-    #print(txid)
+    blsKey = dashd.rpc_command('bls', 'generate')
+    tx = dash_trezor.get_register_mn_protx(blsKey['public'], 0)
+    txstruct = dashd.rpc_command("decoderawtransaction", tx.hex())
+    print(txstruct)
+    txid = dashd.rpc_command("sendrawtransaction", tx.hex())
+    print(txid)
 
     # wipe device to have ability to load custom configuration in the next run
     DashTrezor.wipe_device(client)
