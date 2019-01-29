@@ -98,7 +98,6 @@ def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_pa
 
     R = messages.RequestType
     while isinstance(res, messages.TxRequest):
-        print(res)
         # If there's some part of signed transaction, let's add it
         if res.serialized:
             if res.serialized.serialized_tx:
@@ -155,8 +154,6 @@ def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_pa
     if None in signatures:
         raise RuntimeError("Some signatures are missing!")
 
-    print("Signatures: ", signatures)
-    print("Serialized tx: ", serialized_tx)
     return signatures, serialized_tx
 
 
@@ -170,7 +167,7 @@ def unpack_hex(hex_data):
 
 def keyid_from_address(address):
     data = b58decode(address, None)
-    return data[1:].hex()
+    return data[1:21].hex()
 
 
 def dash_proregtx_payload(collateral_out,  address, port, ownerKeyId,
@@ -185,7 +182,7 @@ def dash_proregtx_payload(collateral_out,  address, port, ownerKeyId,
         r += struct.pack("c", b'\x00')
     r += struct.pack('<I', collateral_out)  # collateral out
     # ip address
-    if not address=="0.0.0.0":
+    if not address == "0.0.0.0":
         r += socket.inet_aton(address)
     else:
         r += struct.pack('<Q', 0)
@@ -489,6 +486,7 @@ def main():
     #dash_trezor.register_mn_with_external_collateral(dashd)
     #dashd.rpc_command("sendtoaddress", dash_trezor.address, 1001)
     blsKey = dashd.rpc_command('bls', 'generate')
+    print("blsKey: ", blsKey)
     tx = dash_trezor.get_register_mn_protx(blsKey['public'], 0)
     txstruct = dashd.rpc_command("decoderawtransaction", tx.hex())
     print(txstruct)
