@@ -170,8 +170,28 @@ def keyid_from_address(address):
     return data[1:21].hex()
 
 
+def serialize_payee_script(keyid):
+    # standard pay-to-pubkeyhash script,
+    # OP_DUP OP_HASH160 <PubkeyHash> OP_EQUALVERIFY OP_CHECKSIG,
+    # constant length 25 byte
+    r = b'\x19'  # = 25, script length
+    r += struct.pack("c", b'\x76')  # OP_DUP
+    r += struct.pack("c", b'\xa9')  # OP_HASH160
+    r += struct.pack("c", b'\x14')  # keyid length
+    r += unpack_hex(keyid)
+    r += struct.pack("c", b'\x88')  # OP_EQUALVERIFY
+    r += struct.pack("c", b'\xac')  # OP_CHECKSIG
+    return r
+
+
+def reverse_bytes(bytes_data):
+    res = bytearray(bytes_data)
+    res.reverse()
+    return bytes(res)
+
+
 def dash_proregtx_payload(collateral_out,  address, port, ownerKeyId,
-                          operatorKey, votingKeyId, operatorReward,
+                          operatorKey, votingKeyId, payeeKeyId, operatorReward,
                           inputsHash):
     r = b""
     r += struct.pack("<H", 1)  # version
@@ -192,9 +212,10 @@ def dash_proregtx_payload(collateral_out,  address, port, ownerKeyId,
     r += unpack_hex(operatorKey)  # operator key
     r += unpack_hex(votingKeyId)  # voting keyid
     r += struct.pack("<H", operatorReward) # operator reward
-    r += struct.pack("c", b'\x00')  # payout script
+    r += serialize_payee_script(payeeKeyId)# payout script
     r += inputsHash  # inputs hash
     r += struct.pack("c", b'\x00')  # payload signature
+    print("payload: ", r.hex())
     return r
 
 
@@ -203,6 +224,7 @@ class HashWriter:
         self.data = b''
 
     def add_data(self, data):
+        print("Hash data:", data.hex())
         self.data += data
 
     def get_hash(self):
@@ -237,6 +259,8 @@ class DashTrezor:
         self.address = self.client.get_address('Dash Testnet', self.bip32_path)
         path = parse_path("44'/1'/0'/0/0/0")
         self.collateral_address = self.client.get_address('Dash Testnet', path)
+        path = parse_path("44'/1'/0'/0/0/0/0")
+        self.owner_address = self.client.get_address('Dash Testnet', path)
         # api to get balance, etc
         self.api = InsightApi('https://testnet-insight.dashevo.org/insight-api/')
 
@@ -375,8 +399,8 @@ class DashTrezor:
             in_amount += Decimal(utxo['amount'])
             inputs.append(new_input)
             txes[bytes.fromhex(utxo['txid'])] = self.api.get_tx(utxo['txid'])
-            hash_writer.add_data(bytes.fromhex(utxo['txid']))
-            hash_writer.add_data(int(utxo['vout']).to_bytes(4, "big"))
+            hash_writer.add_data(reverse_bytes(bytes.fromhex(utxo['txid'])))
+            hash_writer.add_data(int(utxo['vout']).to_bytes(4, "little"))
 
         # prepare outputs
         outputs = []
@@ -398,10 +422,12 @@ class DashTrezor:
             outputs.append(change_output)
 
         inputsHash = hash_writer.get_hash()
+        print("inputsHash: ", inputsHash.hex())
         payload = dash_proregtx_payload(0, "0.0.0.0", 0,
-                                        keyid_from_address(self.collateral_address),
+                                        keyid_from_address(self.owner_address),
                                         operatorKey,
-                                        keyid_from_address(self.collateral_address),
+                                        keyid_from_address(self.owner_address),
+                                        keyid_from_address(self.address),
                                         operatorReward, inputsHash)
 
         # transaction details
