@@ -12,6 +12,7 @@ import base64
 import struct
 import socket
 from mnemonic import Mnemonic
+import re
 
 _DASH_COIN = 100000000
 
@@ -246,16 +247,40 @@ class InsightApi:
         data = self._fetch_json("tx", txhash)
         return rpc_tx_to_msg_tx(data)
 
-    def get_addr_data(self, address):
-        return self._fetch_json("addr", address)
+    def get_addr_balance(self, address):
+        return self._fetch_json("addr", address)["balance"]
 
     def get_addr_utxo(self, address):
         return self._fetch_json("addr", address, "utxo")
 
 
+class LocalInfoApi:
+    def __init__(self, dashd):
+        self.dashd = dashd
+
+    def get_tx(self, txhash):
+        rawtx = self.dashd.rpc_command('getrawtransaction', txhash)
+        txstruct = self.dashd.rpc_command("decoderawtransaction", rawtx)
+        return rpc_tx_to_msg_tx(txstruct)
+
+    def get_addr_balance(self, address):
+        data = {"addresses": [address]}
+        return self.dashd.rpc_command('getaddressbalance', data)["balance"] / _DASH_COIN
+
+    def get_addr_utxo(self, address):
+        data = {"addresses": [address]}
+        res = self.dashd.rpc_command('getaddressutxos', data)
+        print(res)
+        # fix field set to useas insight api output
+        for utxo in res:
+            utxo['vout'] = utxo['outputIndex']
+            utxo['amount'] = utxo['satoshis'] / _DASH_COIN
+        print(res)
+        return res
+
+
 class DashTrezor:
-    def __init__(self, client, seed):
-        print("ctor")
+    def __init__(self, client, api, seed):
         DashTrezor.load_device(client, seed)
         self.client = client
         # Get the first address of first BIP44 account
@@ -266,8 +291,7 @@ class DashTrezor:
         self.collateral_address = self.client.get_address('Dash Testnet', path)
         path = parse_path("44'/1'/0'/0/0/0/0")
         self.owner_address = self.client.get_address('Dash Testnet', path)
-        # api to get balance, etc
-        self.api = InsightApi('https://testnet-insight.dashevo.org/insight-api/')
+        self.api = api
 
     @classmethod
     def load_device(cls, client, seed_mnemonic):
@@ -289,7 +313,6 @@ class DashTrezor:
         client.call(messages.WipeDevice())
 
     def __enter__(self):
-        print("enter")
         return self
 
     def __exit__(self, type, value, traceback):
@@ -298,8 +321,7 @@ class DashTrezor:
     def trezor_balance(self, address=None):
         if address is None:
             address = self.address
-        data = self.api.get_addr_data(address)
-        return data['balance']
+        return self.api.get_addr_balance(address)
 
     def send_to_address(self, address, amount):
         # prepare inputs
@@ -508,15 +530,19 @@ def main():
     # Creates object for manipulating TREZOR
     client = TrezorClientDebugLink(transport=transport)
 
+    dashd = DashdApi.from_dash_conf(DashConfig.get_default_dash_conf())
+
+    # api to get balance, etc
+    # api = InsightApi('https://testnet-insight.dashevo.org/insight-api/')
+    api = LocalInfoApi(dashd)
+
     # Load custom configuration to use device with the same params
     seed = "material humble noble wrestle hen infant quote world name result cake ankle snack buffalo donor vessel chalk bamboo remove announce valid snack alarm index"
-    with DashTrezor(client, seed) as dash_trezor:
+    with DashTrezor(client, api, seed) as dash_trezor:
         print('Trezor address:', dash_trezor.address)
         print('Trezor balance:', dash_trezor.trezor_balance())
         print('Trezor collateral address:', dash_trezor.collateral_address)
         print('Trezor collateral balance:', dash_trezor.trezor_balance(dash_trezor.collateral_address))
-
-        dashd = DashdApi.from_dash_conf(DashConfig.get_default_dash_conf())
 
         #signed_tx = dash_trezor.send_to_address("yPD5e2HPC1m2bJnnqprrrHbGwk8ujFBHRc", 0.01)
         #txstruct = dashd.rpc_command("decoderawtransaction", signed_tx.hex())
