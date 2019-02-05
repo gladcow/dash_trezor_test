@@ -216,7 +216,10 @@ def dash_proregtx_payload(collateral_out,  address, port, ownerKeyId,
     r += inputsHash  # inputs hash
     r += struct.pack("c", b'\x00')  # payload signature
     print("payload: ", r.hex())
-    return r
+    size = len(r)
+    buf = int(size).to_bytes(1, "big")
+    buf += r
+    return buf
 
 
 class HashWriter:
@@ -251,7 +254,9 @@ class InsightApi:
 
 
 class DashTrezor:
-    def __init__(self, client):
+    def __init__(self, client, seed):
+        print("ctor")
+        DashTrezor.load_device(client, seed)
         self.client = client
         # Get the first address of first BIP44 account
         # (should be the same address as shown in wallet.trezor.io)
@@ -282,6 +287,13 @@ class DashTrezor:
     @classmethod
     def wipe_device(cls, client):
         client.call(messages.WipeDevice())
+
+    def __enter__(self):
+        print("enter")
+        return self
+
+    def __exit__(self, type, value, traceback):
+        DashTrezor.wipe_device(self.client)
 
     def trezor_balance(self, address=None):
         if address is None:
@@ -389,7 +401,7 @@ class DashTrezor:
                 break
             fee = fee + Decimal(0.00001)
             new_input = messages.TxInputType(
-                address_n=parse_path("44'/1'/0'/0/0/0"),
+                address_n=self.bip32_path,
                 prev_hash=bytes.fromhex(utxo['txid']),
                 prev_index=int(utxo['vout']),
                 amount=int(Decimal(utxo['amount']) * _DASH_COIN),
@@ -461,6 +473,7 @@ class DashTrezor:
             )
             in_amount += Decimal(utxo['amount'])
             inputs.append(new_input)
+            print("Txid: ", utxo['txid'])
             txes[bytes.fromhex(utxo['txid'])] = self.api.get_tx(utxo['txid'])
 
         in_amount -= fee
@@ -496,31 +509,28 @@ def main():
     client = TrezorClientDebugLink(transport=transport)
 
     # Load custom configuration to use device with the same params
-    DashTrezor.load_device(client,
-                           "material humble noble wrestle hen infant quote world name result cake ankle snack buffalo donor vessel chalk bamboo remove announce valid snack alarm index")
+    seed = "material humble noble wrestle hen infant quote world name result cake ankle snack buffalo donor vessel chalk bamboo remove announce valid snack alarm index"
+    with DashTrezor(client, seed) as dash_trezor:
+        print('Trezor address:', dash_trezor.address)
+        print('Trezor balance:', dash_trezor.trezor_balance())
+        print('Trezor collateral address:', dash_trezor.collateral_address)
+        print('Trezor collateral balance:', dash_trezor.trezor_balance(dash_trezor.collateral_address))
 
-    dash_trezor = DashTrezor(client)
-    print('Trezor address:', dash_trezor.address)
-    print('Trezor balance:', dash_trezor.trezor_balance())
-    print('Trezor collateral address:', dash_trezor.collateral_address)
-    print('Trezor collateral balance:', dash_trezor.trezor_balance(dash_trezor.collateral_address))
+        dashd = DashdApi.from_dash_conf(DashConfig.get_default_dash_conf())
 
-    dashd = DashdApi.from_dash_conf(DashConfig.get_default_dash_conf())
-
-    #signed_tx = dash_trezor.send_to_address("yPD5e2HPC1m2bJnnqprrrHbGwk8ujFBHRc", 1)
-    #dashd.rpc_command("sendrawtransaction", signed_tx.hex())
-    #dash_trezor.register_mn_with_external_collateral(dashd)
-    #dashd.rpc_command("sendtoaddress", dash_trezor.address, 1001)
-    blsKey = dashd.rpc_command('bls', 'generate')
-    print("blsKey: ", blsKey)
-    tx = dash_trezor.get_register_mn_protx(blsKey['public'], 0)
-    txstruct = dashd.rpc_command("decoderawtransaction", tx.hex())
-    print(txstruct)
-    txid = dashd.rpc_command("sendrawtransaction", tx.hex())
-    print(txid)
-
-    # wipe device to have ability to load custom configuration in the next run
-    DashTrezor.wipe_device(client)
+        #signed_tx = dash_trezor.send_to_address("yPD5e2HPC1m2bJnnqprrrHbGwk8ujFBHRc", 0.01)
+        #txstruct = dashd.rpc_command("decoderawtransaction", signed_tx.hex())
+        #print(txstruct)
+        #dashd.rpc_command("sendrawtransaction", signed_tx.hex())
+        #dash_trezor.register_mn_with_external_collateral(dashd)
+        #dashd.rpc_command("sendtoaddress", dash_trezor.address, 1001)
+        #blsKey = dashd.rpc_command('bls', 'generate')
+        #tx = dash_trezor.get_register_mn_protx(blsKey['public'], 0)
+        tx = dash_trezor.move_collateral_to_base()
+        txstruct = dashd.rpc_command("decoderawtransaction", tx.hex())
+        print(txstruct)
+        txid = dashd.rpc_command("sendrawtransaction", tx.hex())
+        print(txid)
 
     client.close()
 
