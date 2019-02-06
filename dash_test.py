@@ -76,7 +76,7 @@ def rpc_tx_to_msg_tx(data):
     t.inputs = [_rpc_to_input(vin) for vin in data["vin"]]
     t.bin_outputs = [_rpc_to_bin_output(vout) for vout in data["vout"]]
 
-    if len(data['extra_data']) > 0:
+    if 'extra_data' in data:
         t.extra_data = unpack_hex(data['extra_data'])
         t.extra_data_len = len(t.extra_data)
 
@@ -284,7 +284,8 @@ class LocalInfoApi:
     def get_tx(self, txhash):
         rawtx = self.dashd.rpc_command('getrawtransaction', txhash)
         txstruct = self.dashd.rpc_command("decoderawtransaction", rawtx)
-        if int(txstruct['extraPayloadSize']) > 0:
+        print(txstruct)
+        if 'extraPayloadSize' in txstruct:
             txstruct['extra_data'] = compactsize(txstruct['extraPayloadSize']).hex() + txstruct['extraPayload']
         version = int(txstruct['version'])
         type = int(txstruct['type'])
@@ -299,12 +300,10 @@ class LocalInfoApi:
     def get_addr_utxo(self, address):
         data = {"addresses": [address]}
         res = self.dashd.rpc_command('getaddressutxos', data)
-        print(res)
         # fix field set to useas insight api output
         for utxo in res:
             utxo['vout'] = utxo['outputIndex']
             utxo['amount'] = utxo['satoshis'] / _DASH_COIN
-        print(res)
         return res
 
 
@@ -579,9 +578,9 @@ def main():
         #dashd.rpc_command("sendrawtransaction", signed_tx.hex())
         #dash_trezor.register_mn_with_external_collateral(dashd)
         #dashd.rpc_command("sendtoaddress", dash_trezor.address, 1001)
-        #blsKey = dashd.rpc_command('bls', 'generate')
-        #tx = dash_trezor.get_register_mn_protx(blsKey['public'], 0)
-        tx = dash_trezor.move_collateral_to_base()
+        blsKey = dashd.rpc_command('bls', 'generate')
+        tx = dash_trezor.get_register_mn_protx(blsKey['public'], 0)
+        #tx = dash_trezor.move_collateral_to_base()
         txstruct = dashd.rpc_command("decoderawtransaction", tx.hex())
         print(txstruct)
         txid = dashd.rpc_command("sendrawtransaction", tx.hex())
