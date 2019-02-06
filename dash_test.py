@@ -12,9 +12,35 @@ import base64
 import struct
 import socket
 from mnemonic import Mnemonic
-import re
+
 
 _DASH_COIN = 100000000
+
+
+def compactsize(val):
+    n = int(val)
+    r = b''
+
+    if n < 253:
+        r += n.to_bytes(1, "big")
+        return r
+
+    if n < 0x10000:
+        r += b'/253'
+        r += n.to_bytes(2, "big")
+        return r
+
+    r += b'/254'
+    r += n.to_bytes(4, "big")
+    return r
+
+
+def unpack_hex(hex_data):
+    r = b""
+    data_bytes = bytes.fromhex(hex_data)
+    for b in data_bytes:
+        r += struct.pack('c', b.to_bytes(1, "big"))
+    return r
 
 
 def _rpc_to_input(vin):
@@ -49,6 +75,10 @@ def rpc_tx_to_msg_tx(data):
 
     t.inputs = [_rpc_to_input(vin) for vin in data["vin"]]
     t.bin_outputs = [_rpc_to_bin_output(vout) for vout in data["vout"]]
+
+    if len(data['extra_data']) > 0:
+        t.extra_data = unpack_hex(data['extra_data'])
+        t.extra_data_len = len(t.extra_data)
 
     return t
 
@@ -93,7 +123,7 @@ def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_pa
         tx_copy.outputs_cnt = len(tx.bin_outputs or tx.outputs)
         tx_copy.outputs = []
         tx_copy.bin_outputs = []
-        tx_copy.extra_data_len = len(tx.extra_data or b"")
+        tx_copy.extra_data_len = tx.extra_data_len
         tx_copy.extra_data = None
         return tx_copy
 
@@ -121,6 +151,7 @@ def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_pa
         if res.request_type == R.TXMETA:
             print("R.TXMETA")
             msg = copy_tx_meta(current_tx)
+            print(msg)
             res = client.call(messages.TxAck(tx=msg))
 
         elif res.request_type == R.TXINPUT:
@@ -156,14 +187,6 @@ def dash_sign_tx(client, inputs, outputs, details=None, prev_txes=None, extra_pa
         raise RuntimeError("Some signatures are missing!")
 
     return signatures, serialized_tx
-
-
-def unpack_hex(hex_data):
-    r = b""
-    data_bytes = bytes.fromhex(hex_data)
-    for b in data_bytes:
-        r += struct.pack('c', b.to_bytes(1, "big"))
-    return r
 
 
 def keyid_from_address(address):
@@ -261,6 +284,9 @@ class LocalInfoApi:
     def get_tx(self, txhash):
         rawtx = self.dashd.rpc_command('getrawtransaction', txhash)
         txstruct = self.dashd.rpc_command("decoderawtransaction", rawtx)
+        if int(txstruct['extraPayloadSize']) > 0:
+            txstruct['extra_data'] = compactsize(txstruct['extraPayloadSize']).hex() + txstruct['extraPayload']
+        print(txstruct)
         return rpc_tx_to_msg_tx(txstruct)
 
     def get_addr_balance(self, address):
