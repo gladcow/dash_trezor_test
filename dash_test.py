@@ -286,6 +286,9 @@ class LocalInfoApi:
         txstruct = self.dashd.rpc_command("decoderawtransaction", rawtx)
         if int(txstruct['extraPayloadSize']) > 0:
             txstruct['extra_data'] = compactsize(txstruct['extraPayloadSize']).hex() + txstruct['extraPayload']
+        version = int(txstruct['version'])
+        type = int(txstruct['type'])
+        txstruct['version'] = version | (type << 16)
         print(txstruct)
         return rpc_tx_to_msg_tx(txstruct)
 
